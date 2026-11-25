@@ -280,10 +280,11 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
     }));
     const run = (stores, mode, fn) => open().then(db => new Promise((res, rej) => {
       const t = db.transaction(stores, mode);
-      let out;
-      const reqs = fn(...[].concat(stores).map(s => t.objectStore(s)));
+      let reqs;
+      try { reqs = fn(...[].concat(stores).map(s => t.objectStore(s))); }
+      catch (e) { try { t.abort(); } catch {} rej(e); return; }
       t.oncomplete = () => res(Array.isArray(reqs) ? reqs.map(r => r && r.result) : reqs && reqs.result);
-      t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('abort'));
+      t.onerror = () => rej(t.error || new Error('idb')); t.onabort = () => rej(t.error || new Error('abort'));
     }));
     return {
       get: (s, k) => run(s, 'readonly', st => st.get(k)),
@@ -293,6 +294,11 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
       delBook: id => run(['meta', 'data'], 'readwrite', (m, d) => [m.delete(id), d.delete(id)]),
     };
   })();
+
+  /* Safari cannot store a File picked from the Files app (nor many Blobs) in IndexedDB:
+     the put fails and can leave the store stuck. Plain ArrayBuffers always work. */
+  const toStored = async f => ({ name: f.name, type: f.blob.type || '', buf: await f.blob.arrayBuffer() });
+  const fromStored = f => ({ name: f.name, blob: f.blob || new Blob([f.buf], { type: f.type || '' }) });
 
   /* Crypto for hidden books: PBKDF2 -> AES-GCM, data encrypted in 4 MB chunks. */
   const te = new TextEncoder(), td = new TextDecoder();
@@ -376,7 +382,9 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
       if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
       const thumb = firstUrl ? await makeThumb(firstUrl) : '';
       const meta = { id: 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), sigh, hidden: false, size, addedAt: Date.now(), openedAt, title, sig, kind, count, thumb };
-      await DB.putBook(meta, { files: files.map(f => ({ name: f.name, blob: f.blob })) });
+      const stored = [];
+      for (const f of files) stored.push(await toStored(f));
+      await DB.putBook(meta, { files: stored });
       await loadShelf();
       if (!quiet) toast('Đã lưu vào kệ. Lần sau mở từ menu ☰.');
       return meta.id;
@@ -404,7 +412,7 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
   async function loadFiles(meta) {
     const data = await DB.get('data', meta.id);
     if (!data) throw new Error('missing');
-    if (!meta.hidden) return data.files;
+    if (!meta.hidden) return data.files.map(fromStored);
     const out = [];
     for (let i = 0; i < data.files.length; i++) out.push({ name: meta.names[i], blob: await decBlob(vaultKey, data.files[i].e) });
     return out;
@@ -456,6 +464,11 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
   /* ---------- Hidden books ---------- */
   async function ensurePassword() {
     if (vaultKey) return true;
+    if (!(window.crypto && crypto.subtle)) {
+      // WebCrypto only exists on https:// (or localhost). Over http://<LAN IP> it is undefined.
+      toast('Truyện ẩn cần mở trang bằng https:// (ví dụ trang GitHub Pages).');
+      return false;
+    }
     lockInfo = await DB.get('kv', 'lock');
     if (!lockInfo) {
       const v = await dialog({
@@ -500,7 +513,7 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
       const data = await DB.get('data', meta.id);
       const names = data.files.map(f => f.name);
       const encFiles = [];
-      for (const f of data.files) encFiles.push({ e: await encBlob(vaultKey, f.blob) });
+      for (const f of data.files) encFiles.push({ e: await encBlob(vaultKey, fromStored(f).blob) });
       const pub = { title: meta.title, sig: meta.sig, kind: meta.kind, count: meta.count, thumb: meta.thumb, openedAt: meta.openedAt, names };
       const sealedMeta = { id: meta.id, sigh: meta.sigh, hidden: true, size: meta.size, addedAt: meta.addedAt, sealed: await encJSON(vaultKey, pub) };
       await DB.putBook(sealedMeta, { files: encFiles });
@@ -517,7 +530,9 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
       busy('Đang giải mã…');
       const files = await loadFiles(meta);
       const pub = { id: meta.id, sigh: meta.sigh, hidden: false, size: meta.size, addedAt: meta.addedAt, openedAt: meta.openedAt, title: meta.title, sig: meta.sig, kind: meta.kind, count: meta.count, thumb: meta.thumb };
-      await DB.putBook(pub, { files });
+      const stored = [];
+      for (const f of files) stored.push(await toStored(f));
+      await DB.putBook(pub, { files: stored });
       busy(); await loadShelf();
       toast('Đã bỏ ẩn.');
     } catch { busy(); toast('Không bỏ ẩn được truyện này.'); }
@@ -638,7 +653,9 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
         if (onOk) onOk(vals);   // runs inside the tap, so Share is allowed
         if (validate) {
           const btn = form.querySelector('[type=submit]'); btn.disabled = true;
-          const err = await validate(vals); btn.disabled = false;
+          let err;
+          try { err = await validate(vals); } catch { err = 'Có lỗi, thử lại nhé.'; }
+          btn.disabled = false;
           if (err) { form.querySelector('.err').textContent = err; return; }
         }
         done(vals);
@@ -945,8 +962,10 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
   }, { passive: true });
 
   /* Controls */
-  $('pick').addEventListener('change', e => handleFiles(e.target.files));
-  $('pickDir').addEventListener('change', e => handleFiles(e.target.files));
+  // Copy the list, then clear the input so picking the same files again still fires "change".
+  const onPick = e => { const fs = [...e.target.files]; e.target.value = ''; handleFiles(fs); };
+  $('pick').addEventListener('change', onPick);
+  $('pickDir').addEventListener('change', onPick);
   $('demo').addEventListener('click', makeDemo);
   $('back').addEventListener('click', closeBook);
   $('mScroll').addEventListener('click', () => { if (prefs.mode !== 'scroll') { prefs.mode = 'scroll'; savePrefs(); applyMode(); } });
