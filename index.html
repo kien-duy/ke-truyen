@@ -291,8 +291,13 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
       all: s => run(s, 'readonly', st => st.getAll()),
       put: (s, v, k) => run(s, 'readwrite', st => k === undefined ? st.put(v) : st.put(v, k)),
       putBook: (meta, data) => run(['meta', 'data'], 'readwrite', (m, d) => [m.put(meta), d.put(data, meta.id)]),
-      delBook: id => run(['meta', 'data'], 'readwrite', (m, d) => [m.delete(id), d.delete(id)]),
+      delBook: id => run(['meta', 'data'], 'readwrite', (m, d) => [m.delete(id), d.delete(id), d.delete(chunkRange(id))]),
+      // Encrypted chunks of a hidden book live in 'data' under "<id>#<file>#<chunk>".
+      putChunk: (id, i, c, v) => run('data', 'readwrite', st => st.put(v, `${id}#${i}#${c}`)),
+      getChunk: (id, i, c) => run('data', 'readonly', st => st.get(`${id}#${i}#${c}`)),
+      delChunks: id => run('data', 'readwrite', st => st.delete(chunkRange(id))),
     };
+    function chunkRange(id) { return IDBKeyRange.bound(id + '#', id + '#￿'); }
   })();
 
   /* Safari cannot store a File picked from the Files app (nor many Blobs) in IndexedDB:
@@ -312,11 +317,7 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
   const decBuf = (key, e) => crypto.subtle.decrypt({ name: 'AES-GCM', iv: e.iv }, key, e.data);
   const encJSON = (key, o) => encBuf(key, te.encode(JSON.stringify(o)));
   const decJSON = async (key, e) => JSON.parse(td.decode(await decBuf(key, e)));
-  async function encBlob(key, blob) {
-    const chunks = [];
-    for (let o = 0; o < blob.size; o += CHUNK) chunks.push(await encBuf(key, await blob.slice(o, o + CHUNK).arrayBuffer()));
-    return { type: blob.type, chunks };
-  }
+  // Older hidden books kept every chunk inside one record: {e: {type, chunks}}.
   async function decBlob(key, e) {
     const parts = [];
     for (const c of e.chunks) parts.push(await decBuf(key, c));
@@ -414,7 +415,21 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
     if (!data) throw new Error('missing');
     if (!meta.hidden) return data.files.map(fromStored);
     const out = [];
-    for (let i = 0; i < data.files.length; i++) out.push({ name: meta.names[i], blob: await decBlob(vaultKey, data.files[i].e) });
+    for (let i = 0; i < data.files.length; i++) {
+      const f = data.files[i];
+      let blob;
+      if (f.e) blob = await decBlob(vaultKey, f.e);
+      else {
+        const parts = [];
+        for (let c = 0; c < f.n; c++) {
+          const e = await DB.getChunk(meta.id, i, c);
+          if (!e) throw new Error('missing');
+          parts.push(await decBuf(vaultKey, e));
+        }
+        blob = new Blob(parts, { type: f.type || '' });
+      }
+      out.push({ name: meta.names[i], blob });
+    }
     return out;
   }
 
@@ -510,20 +525,48 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
     if (!(await ensurePassword())) return;
     try {
       busy('Đang mã hoá…');
-      const data = await DB.get('data', meta.id);
+      if (navigator.storage && navigator.storage.estimate) {
+        // The encrypted copy is written before the plain one is dropped, so it needs the book's size free.
+        const { usage = 0, quota = 0 } = await navigator.storage.estimate();
+        if (quota && usage + meta.size > quota * 0.98) { busy(); toast('Máy không đủ chỗ trống để ẩn truyện này.'); return; }
+      }
+      let data = await DB.get('data', meta.id);
+      if (!data) throw new Error('missing');
       const names = data.files.map(f => f.name);
-      const encFiles = [];
-      for (const f of data.files) encFiles.push({ e: await encBlob(vaultKey, fromStored(f).blob) });
+      // Encrypt and write one 4 MB chunk at a time: a whole book held twice in memory and
+      // written as one huge record is more than iPhone Safari allows for big books.
+      const index = [];
+      const total = data.files.reduce((s, f) => s + (f.buf ? f.buf.byteLength : f.blob.size), 0) || 1;
+      let doneBytes = 0;
+      for (let i = 0; i < data.files.length; i++) {
+        const f = data.files[i];
+        const size = f.buf ? f.buf.byteLength : f.blob.size;
+        let n = 0;
+        for (let o = 0; o < size; o += CHUNK, n++) {
+          const part = f.buf ? f.buf.slice(o, o + CHUNK) : await f.blob.slice(o, o + CHUNK).arrayBuffer();
+          await DB.putChunk(meta.id, i, n, await encBuf(vaultKey, part));
+          doneBytes += part.byteLength;
+          busy(`Đang mã hoá ${Math.floor(doneBytes / total * 100)}%…`);
+        }
+        index.push({ type: f.type || (f.blob && f.blob.type) || '', n });
+      }
+      data = null;
       const pub = { title: meta.title, sig: meta.sig, kind: meta.kind, count: meta.count, thumb: meta.thumb, openedAt: meta.openedAt, names };
       const sealedMeta = { id: meta.id, sigh: meta.sigh, hidden: true, size: meta.size, addedAt: meta.addedAt, sealed: await encJSON(vaultKey, pub) };
-      await DB.putBook(sealedMeta, { files: encFiles });
+      await DB.putBook(sealedMeta, { files: index });   // replaces (and frees) the plain copy
       // drop clear-text traces
       const last = store.get('kt:last', null);
       if (last && last.title === meta.title) store.del('kt:last');
       busy(); await loadShelf(); showResume();
       toast('Đã ẩn. Mở lại trong mục Truyện ẩn.');
-    } catch { busy(); toast('Không ẩn được truyện này.'); }
+    } catch (e) {
+      busy();
+      DB.delChunks(meta.id).catch(() => {});   // the plain copy is untouched; drop half-written chunks
+      toast(e && e.name === 'QuotaExceededError' ? 'Máy không đủ chỗ trống để ẩn truyện này.' : 'Không ẩn được truyện này' + errTag(e) + '.');
+    }
   }
+  // Short error name in messages, so a failure reported from a phone says where it broke.
+  const errTag = e => e && (e.name || e.message) ? ` (${e.name && e.name !== 'Error' ? e.name : e.message})` : '';
 
   async function unhideBook(meta) {
     try {
@@ -533,9 +576,10 @@ input[type=range]{flex:1;min-width:0;accent-color:var(--tone);height:28px}
       const stored = [];
       for (const f of files) stored.push(await toStored(f));
       await DB.putBook(pub, { files: stored });
+      DB.delChunks(meta.id).catch(() => {});
       busy(); await loadShelf();
       toast('Đã bỏ ẩn.');
-    } catch { busy(); toast('Không bỏ ẩn được truyện này.'); }
+    } catch (e) { busy(); toast('Không bỏ ẩn được truyện này' + errTag(e) + '.'); }
   }
 
   /* ---------- Drawer UI ---------- */
